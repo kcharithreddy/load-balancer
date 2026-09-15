@@ -1,0 +1,37 @@
+# Environment & Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Keys & Secret Data
+*.key
+*.pem
+
+# Database & Runtime Logs
+*.db
+*.log
+chat.db*
+
+# Automation & Deployment Scripts (Excluded for GitHub Cleanliness)
+deploy_*.py
+fix_*.py
+diagnose*.py
+run_*.py
+update_*.py
+gen_*.py
+generate_*.py
+toggle_*.py
+capture_*.py
+master_deploy.sh
+load_generator/
+metrics/
+report/
+scratch/
+
+# Build Binaries
+ws_load_balancer
+*.exe
+*.o
+*.so
