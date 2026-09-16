@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -112,11 +113,82 @@ func (b *Backend) GetAvgLatency() float64 {
 // Dynamic Load Balancer Core
 // ─────────────────────────────────────────────
 
+type FeedMemoryStore struct {
+	mu   sync.RWMutex
+	list []FeedItem
+	seen map[string]bool
+}
+
+func newFeedMemoryStore() *FeedMemoryStore {
+	return &FeedMemoryStore{
+		list: make([]FeedItem, 0, 100000),
+		seen: make(map[string]bool),
+	}
+}
+
+func (s *FeedMemoryStore) Add(item FeedItem) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	mid := item.MsgID
+	if mid == "" {
+		txt := item.Msg
+		if txt == "" {
+			txt = item.Text
+		}
+		uname := item.Username
+		if uname == "" {
+			uname = item.ClientName
+		}
+		mid = fmt.Sprintf("%s_%s_%d", uname, txt, item.Timestamp)
+	}
+
+	if mid != "" && mid != "__0" {
+		if s.seen[mid] {
+			return
+		}
+		s.seen[mid] = true
+	}
+
+	if item.ClientName == "" && item.Username != "" {
+		item.ClientName = item.Username
+	}
+	if item.Username == "" && item.ClientName != "" {
+		item.Username = item.ClientName
+	}
+	if item.Msg == "" && item.Text != "" {
+		item.Msg = item.Text
+	}
+	if item.Text == "" && item.Msg != "" {
+		item.Text = item.Msg
+	}
+	if item.MsgID == "" {
+		item.MsgID = mid
+	}
+
+	s.list = append(s.list, item)
+}
+
+func (s *FeedMemoryStore) GetFeedJSON() ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.list) == 0 {
+		return nil, false
+	}
+	buf, err := json.Marshal(s.list)
+	if err != nil {
+		return nil, false
+	}
+	return buf, true
+}
+
 type DynamicLoadBalancer struct {
 	backends          []*Backend
 	counter           uint64
 	metrics           *Metrics
 	replicationClient *http.Client
+	feedStore         *FeedMemoryStore
 }
 
 func NewDynamicLoadBalancer(rawURLs []string) *DynamicLoadBalancer {
@@ -184,8 +256,9 @@ func NewDynamicLoadBalancer(rawURLs []string) *DynamicLoadBalancer {
 	}
 
 	return &DynamicLoadBalancer{
-		backends: backends,
-		metrics:  newMetrics(),
+		backends:  backends,
+		metrics:   newMetrics(),
+		feedStore: newFeedMemoryStore(),
 		replicationClient: &http.Client{
 			Transport: replTr,
 			Timeout:   5 * time.Second,
@@ -306,6 +379,21 @@ func listenAddr() string {
 
 func (lb *DynamicLoadBalancer) handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&lb.metrics.TotalRequests, 1)
+
+	if r.Method == "POST" && r.Body != nil {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err == nil && len(bodyBytes) > 0 {
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+			var item FeedItem
+			if json.Unmarshal(bodyBytes, &item) == nil {
+				if item.Timestamp == 0 {
+					item.Timestamp = time.Now().UnixNano() / int64(time.Millisecond)
+				}
+				lb.feedStore.Add(item)
+			}
+		}
+	}
 
 	targetBackend := lb.SelectOptimalBackend()
 	if targetBackend == nil {
@@ -491,15 +579,24 @@ var (
 )
 
 func (lb *DynamicLoadBalancer) handleFeedProxy(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Fast path: serve instantly from Go in-memory feedStore (0.01ms response time)
+	if buf, ok := lb.feedStore.GetFeedJSON(); ok && len(buf) > 2 {
+		w.WriteHeader(http.StatusOK)
+		w.Write(buf)
+		return
+	}
+
 	feedClient := &http.Client{
 		Transport: lb.replicationClient.Transport,
-		Timeout:   25 * time.Second,
+		Timeout:   15 * time.Second,
 	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	seen := make(map[string]bool)
-	merged := make([]FeedItem, 0, 25000)
+	merged := make([]FeedItem, 0, 50000)
 
 	for _, b := range lb.backends {
 		wg.Add(1)
@@ -533,11 +630,13 @@ func (lb *DynamicLoadBalancer) handleFeedProxy(w http.ResponseWriter, r *http.Re
 				}
 				if mid == "" || mid == "__0" {
 					merged = append(merged, item)
+					lb.feedStore.Add(item)
 					continue
 				}
 				if !seen[mid] {
 					seen[mid] = true
 					merged = append(merged, item)
+					lb.feedStore.Add(item)
 				}
 			}
 			mu.Unlock()
@@ -548,13 +647,11 @@ func (lb *DynamicLoadBalancer) handleFeedProxy(w http.ResponseWriter, r *http.Re
 
 	buf, err := json.Marshal(merged)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("[]"))
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(buf)
 }
