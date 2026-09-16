@@ -443,8 +443,8 @@ func (lb *DynamicLoadBalancer) startActiveHealthProbes(interval time.Duration) {
 				}
 				if err != nil || resp.StatusCode != 200 {
 					consecFails[b.Name]++
-					if consecFails[b.Name] >= 5 && b.IsAlive() {
-						log.Printf("[health-probe] Backend DOWN (5 consec fails): %s", b.Name)
+					if consecFails[b.Name] >= 15 && b.IsAlive() {
+						log.Printf("[health-probe] Backend DOWN (15 consec fails): %s", b.Name)
 						b.SetAlive(false)
 					}
 				} else {
@@ -491,33 +491,22 @@ var (
 )
 
 func (lb *DynamicLoadBalancer) handleFeedProxy(w http.ResponseWriter, r *http.Request) {
-	feedCacheLock.RLock()
-	if time.Since(cachedFeedTime) < 2*time.Second && len(cachedFeedBuf) > 0 {
-		buf := cachedFeedBuf
-		feedCacheLock.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(buf)
-		return
+	feedClient := &http.Client{
+		Transport: lb.replicationClient.Transport,
+		Timeout:   25 * time.Second,
 	}
-	feedCacheLock.RUnlock()
-
-	client := &http.Client{Timeout: 3 * time.Second}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	seen := make(map[string]bool)
-	merged := make([]FeedItem, 0, 20000)
+	merged := make([]FeedItem, 0, 25000)
 
 	for _, b := range lb.backends {
-		if !b.IsAlive() {
-			continue
-		}
 		wg.Add(1)
 		targetURL := b.URL.String() + "/feed"
 		go func(target string) {
 			defer wg.Done()
-			resp, err := client.Get(target)
+			resp, err := feedClient.Get(target)
 			if err != nil {
 				return
 			}
@@ -532,7 +521,19 @@ func (lb *DynamicLoadBalancer) handleFeedProxy(w http.ResponseWriter, r *http.Re
 			for _, item := range items {
 				mid := item.MsgID
 				if mid == "" {
-					mid = fmt.Sprintf("%s_%d", item.Username, item.Timestamp)
+					txt := item.Msg
+					if txt == "" {
+						txt = item.Text
+					}
+					uname := item.Username
+					if uname == "" {
+						uname = item.ClientName
+					}
+					mid = fmt.Sprintf("%s_%s_%d", uname, txt, item.Timestamp)
+				}
+				if mid == "" || mid == "__0" {
+					merged = append(merged, item)
+					continue
 				}
 				if !seen[mid] {
 					seen[mid] = true
@@ -552,11 +553,6 @@ func (lb *DynamicLoadBalancer) handleFeedProxy(w http.ResponseWriter, r *http.Re
 		w.Write([]byte("[]"))
 		return
 	}
-
-	feedCacheLock.Lock()
-	cachedFeedBuf = buf
-	cachedFeedTime = time.Now()
-	feedCacheLock.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -604,9 +600,9 @@ func main() {
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  0,
+		WriteTimeout: 0,
+		IdleTimeout:  300 * time.Second,
 	}
 
 	var listener net.Listener

@@ -117,8 +117,35 @@ def db_writer_worker():
                 db_queue.task_done()
 
 
-# Launch background SQLite writer thread
+def peer_sync_worker():
+    """Background worker to asynchronously replicate messages to peer backends."""
+    pool = ThreadPoolExecutor(max_workers=8)
+    while True:
+        try:
+            item = peer_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        for p_url in PEER_URLS:
+            if f":{PORT}" in p_url:
+                continue
+            def sync_to(target, payload):
+                try:
+                    req = urllib.request.Request(
+                        f"{target}/internal/sync",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=2):
+                        pass
+                except Exception:
+                    pass
+            pool.submit(sync_to, p_url, item)
+        peer_queue.task_done()
+
+# Launch background threads
 threading.Thread(target=db_writer_worker, daemon=True).start()
+threading.Thread(target=peer_sync_worker, daemon=True).start()
 
 
 def init_in_memory_cache():
@@ -173,8 +200,10 @@ def static_files(filename):
 
 
 def broadcast(payload, exclude=None):
-    data = json.dumps(payload)
     with clients_lock:
+        if not clients:
+            return
+        data = json.dumps(payload)
         dead = []
         for ws in list(clients.keys()):
             if ws is exclude:
@@ -270,7 +299,6 @@ def api_message():
     with feed_lock:
         feed_memory_list.append(item)
         feed_memory_dict[msg_id] = item
-        update_feed_json_cache()
 
     payload = {
         "msg_id": msg_id,
@@ -315,7 +343,9 @@ def api_message():
 
 @app.route("/feed", methods=["GET", "POST"])
 def api_feed():
-    return Response(feed_memory_json_bytes, mimetype="application/json"), 200
+    with feed_lock:
+        data = json.dumps(feed_memory_list)
+    return Response(data, mimetype="application/json"), 200
 
 
 # ─────────────────────────────────────────────────────────────
